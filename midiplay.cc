@@ -18,41 +18,77 @@ typedef struct vswprintf {} swprintf;
 
 #include <assert.h>
 
-#if !defined(__WIN32__) || defined(__CYGWIN__)
-# include <termio.h>
-# include <fcntl.h>
-# include <sys/ioctl.h>
+#ifdef __DJGPP__
+# include <conio.h>
+# include <pc.h>
+# include <dpmi.h>
+# include <go32.h>
+# include <sys/farptr.h>
+# include <dos.h>
+#else
+# if !defined(__WIN32__) || defined(__CYGWIN__)
+#  include <termio.h>
+#  include <fcntl.h>
+#  include <sys/ioctl.h>
+# endif
 #endif
 
 #include <deque>
 #include <algorithm>
 
-#include "dbopl.h"
-
-static const unsigned long PCM_RATE = 48000;
-static const unsigned MaxCards = 100;
-static const unsigned MaxSamplesAtTime = 512; // 512=dbopl limitation
+static const unsigned MaxCards = 1;
 static unsigned AdlBank    = 0;
 static unsigned NumFourOps = 7;
-static unsigned NumCards   = 2;
+static unsigned NumCards   = 1;
 static bool QuitFlag = false, FakeDOSshell = false;
 static unsigned SkipForward = 0;
 static bool DoingInstrumentTesting = false;
+
+const unsigned OPLBase = 0x388;
 
 #include "adldata.hh"
 
 static const unsigned short Operators[18] =
     {0x000,0x001,0x002, 0x008,0x009,0x00A, 0x010,0x011,0x012,
      0x100,0x101,0x102, 0x108,0x109,0x10A, 0x110,0x111,0x112 };
+// Operator offsets for operators 0,2,4, 6,8,10, 12,14,16, and
+//                                18,20,22, 24,26,28, 30,32,34.
+// Odd operators are the same +3.
+
 static const unsigned short Channels[18] =
     {0x000,0x001,0x002, 0x003,0x004,0x005, 0x006,0x007,0x008,
      0x100,0x101,0x102, 0x103,0x104,0x105, 0x106,0x107,0x108 };
 
+/*
+    In OPL3 mode:
+         0    1    2    6    7    8     9   10   11    16   17   18
+       op0  op1  op2 op12 op13 op14  op18 op19 op20  op30 op31 op32
+       op3  op4  op5 op15 op16 op17  op21 op22 op23  op33 op34 op35
+         3    4    5                   13   14   15
+       op6  op7  op8                 op24 op25 op26
+       op9 op10 op11                 op27 op28 op29
+    Ports:
+        +0   +1   +2  +10  +11  +12  +100 +101 +102  +110 +111 +112
+        +3   +4   +5  +13  +14  +15  +103 +104 +105  +113 +114 +115
+        +8   +9   +A                 +108 +109 +10A
+        +B   +C   +D                 +10B +10C +10D
+
+    In OPTi mode ("extended FM" in 82C924, 82C925, 82C931 chips):
+         0   1   2    3    4    5    6    7     8    9   10   11   12   13   14   15   16   17
+       op0 op4 op6 op10 op12 op16 op18 op22  op24 op28 op30 op34 op36 op38 op40 op42 op44 op46
+       op1 op5 op7 op11 op13 op17 op19 op23  op25 op29 op31 op35 op37 op39 op41 op43 op45 op47
+       op2     op8      op14      op20       op26      op32
+       op3     op9      op15      op21       op27      op33    for a total of 6 quad + 12 dual
+    Ports: ???
+      
+
+*/
+
+
+
 struct OPL3
 {
     unsigned NumChannels;
-
-    std::vector<DBOPL::Handler> cards;
 private:
     std::vector<unsigned short> ins; // index to adl[], cached, needed by Touch()
     std::vector<unsigned char> pit;  // value poked to B0, cached, needed by NoteOff)(
@@ -61,7 +97,12 @@ public:
 
     void Poke(unsigned card, unsigned index, unsigned value)
     {
-        cards[card].WriteReg(index, value);
+        unsigned o = index >> 8;
+        unsigned port = OPLBase + o * 2;
+        outportb(port, index);
+        for(unsigned c=0; c<6; ++c) inportb(port);
+        outportb(port+1, value);
+        for(unsigned c=0; c<35; ++c) inportb(port);
     }
     void NoteOff(unsigned c)
     {
@@ -123,7 +164,11 @@ public:
     }
     void Reset()
     {
-        cards.resize(NumCards);
+        if(NumCards != 1)
+        {
+            fprintf(stderr, "ERROR: Hardware implementation only supports 1 OPL3 card\n");
+            exit(-1);
+        }
         NumChannels = NumCards * 18;
         ins.resize(NumChannels,     189);
         pit.resize(NumChannels,       0);
@@ -137,7 +182,6 @@ public:
         unsigned fours = NumFourOps;
         for(unsigned card=0; card<NumCards; ++card)
         {
-            cards[card].Init(PCM_RATE);
             for(unsigned a=0; a< sizeof(data)/sizeof(*data); a+=2)
                 Poke(card, data[a], data[a+1]);
             unsigned fours_this_card = fours > 6 ? 6 : fours;
@@ -210,7 +254,7 @@ class Input
 #ifdef __WIN32__
     void* inhandle;
 #endif
-#if !defined(__WIN32__) || defined(__CYGWIN__)
+#if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
     struct termio back;
 #endif
 public:
@@ -219,7 +263,7 @@ public:
 #ifdef __WIN32__
         inhandle = GetStdHandle(STD_INPUT_HANDLE);
 #endif
-#if !defined(__WIN32__) || defined(__CYGWIN__)
+#if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
         ioctl(0, TCGETA, &back);
         struct termio term = back;
         term.c_lflag &= ~(ICANON|ECHO);
@@ -230,7 +274,7 @@ public:
     }
     ~Input()
     {
-#if !defined(__WIN32__) || defined(__CYGWIN__)
+#if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
         if(ioctl(0, TCSETA, &back) < 0)
             fcntl(0, F_SETFL, fcntl(0, F_GETFL) &~ O_NONBLOCK);
 #endif
@@ -238,6 +282,9 @@ public:
 
     char PeekInput()
     {
+#ifdef __DJGPP__
+        if(kbhit()) return getch();
+#endif
 #ifdef __WIN32__
         DWORD nread=0;
         INPUT_RECORD inbuf[1];
@@ -253,7 +300,7 @@ public:
                 return c;
         }   }
 #endif
-#if !defined(__WIN32__) || defined(__CYGWIN__)
+#if (!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__)
         char c = 0;
         if(read(0, &c, 1) == 1) return c;
 #endif
@@ -273,6 +320,9 @@ public:
     unsigned char slotcolors[80][1 + 18*MaxCards];
     bool cursor_visible;
 public:
+    #ifdef __DJGPP__
+    # define prn cprintf
+    #endif
     UI(): x(0), y(0), color(-1), txtline(1),
           maxy(0), cursor_visible(true)
     {
@@ -292,11 +342,14 @@ public:
             //SetConsoleScreenBufferSize(handle,size);
         }
       #endif
+      #ifdef __DJGPP__
+        color = 7;
+      #endif
         std::memset(slots, '.',      sizeof(slots));
         std::memset(background, '.', sizeof(background));
         std::fputc('\r', stderr); // Ensure cursor is at x=0
         GotoXY(0,0); Color(15);
-        std::fprintf(stderr, "Hit Ctrl-C to quit\r");
+        prn("Hit Ctrl-C to quit\r");
     }
     void HideCursor()
     {
@@ -314,7 +367,10 @@ public:
       #endif
         if(!DoingInstrumentTesting)
             CheckTetris();
-        std::fprintf(stderr, "\33[?25l"); // hide cursor
+#ifdef __DJGPP__
+        { _setcursortype(_NOCURSOR);return;  }
+#endif
+        prn("\33[?25l"); // hide cursor
     }
     void ShowCursor()
     {
@@ -329,7 +385,10 @@ public:
           return;
         }
       #endif
-        std::fprintf(stderr, "\33[?25h"); // show cursor
+#ifdef __DJGPP__
+        { _setcursortype(_NORMALCURSOR);return;  }
+#endif
+        prn("\33[?25h"); // show cursor
         std::fflush(stderr);
     }
     void PrintLn(const char* fmt, ...) __attribute__((format(printf,2,3)))
@@ -354,7 +413,11 @@ public:
         {
             if(Line[x-beginx] == '\n') break;
             Color(Line[x-beginx] == '.' ? 1 : 8);
+        #ifdef __DJGPP__
+            putch( background[x][txtline] = Line[x-beginx] );
+        #else
             std::fputc( background[x][txtline] = Line[x-beginx], stderr);
+        #endif
         }
         for(int tx=x; tx<80; ++tx)
         {
@@ -362,7 +425,11 @@ public:
             {
                 GotoXY(tx,txtline);
                 Color(1);
+             #ifdef __DJGPP__
+                putch(background[tx][txtline] = '.');
+             #else
                 std::fputc(background[tx][txtline] = '.', stderr);
+             #endif
                 ++x;
             }
         }
@@ -409,6 +476,9 @@ public:
         #ifdef __WIN32__
             if(handle) WriteConsole(handle,&ch,1, 0,0);
             else
+        #endif
+        #ifdef __DJGPP__
+            if(1) putch(ch); else
         #endif
             {
               std::fputc(ch, stderr);
@@ -459,13 +529,16 @@ public:
           SetConsoleCursorPosition(handle, tmp2);
         }
       #endif
-        if(newy < y) { std::fprintf(stderr, "\33[%dA", y-newy); y = newy; }
+#ifdef __DJGPP__
+        { gotoxy(x=newx, wherey()-(y-newy)); y=newy; return; }
+#endif
+        if(newy < y) { prn("\33[%dA", y-newy); y = newy; }
         if(newx != x)
         {
             if(newx == 0 || (newx<10 && std::abs(newx-x)>=10))
                 { std::fputc('\r', stderr); x = 0; }
-            if(newx < x) std::fprintf(stderr, "\33[%dD", x-newx);
-            if(newx > x) std::fprintf(stderr, "\33[%dC", newx-x);
+            if(newx < x) prn("\33[%dD", x-newx);
+            if(newx > x) prn("\33[%dC", newx-x);
             x = newx;
         }
     }
@@ -479,15 +552,19 @@ public:
               SetConsoleTextAttribute(handle, newcolor);
             else
           #endif
+#ifdef __DJGPP__
+            textattr(newcolor);
+            if(0)
+#endif
             {
               static const char map[8+1] = "04261537";
-              std::fprintf(stderr, "\33[0;%s40;3%c",
+              prn("\33[0;%s40;3%c",
                   (newcolor&8) ? "1;" : "", map[newcolor&7]);
               // If xterm-256color is used, try using improved colors:
               //        Translate 8 (dark gray) into #003366 (bluish dark cyan)
               //        Translate 1 (dark blue) into #000033 (darker blue)
-              if(newcolor==8) std::fprintf(stderr, ";38;5;24;25");
-              if(newcolor==1) std::fprintf(stderr, ";38;5;17;25");
+              if(newcolor==8) prn(";38;5;24;25");
+              if(newcolor==1) prn(";38;5;17;25");
               std::fputc('m', stderr);
             }
             color=newcolor;
@@ -513,8 +590,9 @@ public:
 
     void CheckTetris()
     {
+        const unsigned MH = 17;
         extern UI UI;
-        static char area[12][25]={{0}};
+        static char area[12][MH]={{0}};
         static int emptycount;
         static const char empty[5][13]=
             {"!..........!", "!..SINGLE..!", "!..DOUBLE..!",
@@ -531,10 +609,10 @@ public:
                 return shapes[rot][bl] & (1 << (y*4+x));
             }
             static inline bool bounds(int x,int y,bool fix=true)
-                { return x>=0 && y>=0 && (x<12 || !fix) && y<25; }
-            static bool edge(int x,int y) { return x==0||x==11||y>=24; }
+                { return x>=0 && y>=0 && (x<12 || !fix) && y<MH; }
+            static bool edge(int x,int y) { return x==0||x==11||y>=(MH-1); }
             static void init_area()
-                { for(int x=12; x-->0; ) for(int y=25; y-->0; ) area[x][y]=edge(x,y)?2:0; }
+                { for(int x=12; x-->0; ) for(int y=MH; y-->0; ) area[x][y]=edge(x,y)?2:0; }
             static void plotp(int bl,int rot, int x,int y, int color, bool fix)
                 { for(int by=0; by<4; ++by) for(int bx=0; bx<4; ++bx)
                     if(bounds(x+bx,y+by,fix)&&block(bl,rot,bx,by)) setp(x+bx,y+by,color, fix); }
@@ -549,8 +627,8 @@ public:
             {
                 if(fix) area[x][y] = color;
                 static int counter=0; ++counter;
-                int c = color==2&&y<24 ? (counter<700?':':'&')
-                       :color==2       ? (counter<500?'-':'&')
+                int c = color==2&&y<MH-1 ? (counter<700?':':'&')
+                       :color==2         ? (counter<500?'-':'&')
                        :color==-1? '+' // shadow
                        :color    ? '#'
                        : (x<12?empty[emptycount][x]:'.');
@@ -560,7 +638,7 @@ public:
             }
             static void make_full_lines_empty()
             {
-                bool fullline[25];
+                bool fullline[MH];
                 emptycount=0;
                 for(int y=1; !edge(6,y); ++y)
                 {
@@ -573,7 +651,7 @@ public:
             static void cascade_lines()
             {
                 emptycount=0;
-                int y=23; while(edge(6,y)) --y;
+                int y=MH-2; while(edge(6,y)) --y;
                 for(int srcy=y; srcy>0; --srcy)
                 {
                     int x=1; while(x<=10 && !area[x][srcy]) ++x;
@@ -612,7 +690,7 @@ public:
             case 1: // handle input
             {
                 int level = 50 - (lines/10)/5;
-                {int y=std::rand()%25, x=tetris.edge(6,y)?std::rand()%12:(std::rand()%2)*11;
+                {int y=std::rand()%MH, x=tetris.edge(6,y)?std::rand()%12:(std::rand()%2)*11;
                 tetris.setp(x,y,area[x][y]);}
                 for(;;)
                 {
@@ -627,7 +705,7 @@ public:
                                 FakeDOSshell = true;
                                 //passthru
                             case 'q': case 'Q': case 3:
-                            #if !(!defined(__WIN32__) || defined(__CYGWIN__))
+                            #if !((!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__))
                             case 27:
                             #endif
                                 QuitFlag=true; break;
@@ -658,7 +736,7 @@ public:
                     if(tetris.testp(curblock,mr,mx,my))
                     {
                         bool x_changed = curx != mx || currot != mr;
-                        if(x_changed && shadowy<25)
+                        if(x_changed && shadowy<MH-1)
                         {
                             tetris.plotp(curblock,currot,curx,shadowy,0,0); // hide shadow from old location
                         }
@@ -699,8 +777,8 @@ public:
                 UI.GotoXY(15, (int)NumCards*18-5);
                 UI.Color(15); fprintf(stderr,"Next:"); std::fflush(stderr);
                 next2=std::rand()%7;
-                tetris.plotp(next1,0, 13,21, 0,0);
-                tetris.plotp(next2,0, 13,21, 8,0);
+                tetris.plotp(next1,0, 13,MH-4, 0,0);
+                tetris.plotp(next2,0, 13,MH-4, 8,0);
                 if(emptycount)
                 {
                     UI.GotoXY(15,(int)NumCards*18+1);
@@ -712,18 +790,27 @@ public:
             default: ++gamestate; break;
             case 12: if(emptycount) tetris.cascade_lines(); emptycount=gamestate=0; break;
             case 50:
-                if(cury < 24)
+                if(cury < MH-1)
                     { for(int x=1; x<=10; ++x) tetris.setp(x,cury,4); ++cury; break; }
                 cury=-4; gamestate=51; break;
             case 51:
-                if(cury < 24)
+                if(cury < MH-1)
                     { for(int x=1; x<=10; ++x) tetris.setp(x,cury,0); ++cury; break; }
                 emptycount=combo=score=lines=cury=0;
                 gamestate=52; // reset score display
                 break;
         }
     }
-
+private:
+    #ifndef __DJGPP__
+    void prn(const char* fmt, ...)
+    {
+        va_list ap,
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+    #endif
 } UI;
 
 class MIDIplay
@@ -1723,6 +1810,8 @@ private:
     }
 };
 
+#if 0 /* Reverb & PCM audio */
+
 struct Reverb /* This reverb implementation is based on Freeverb impl. in Sox */
 {
     float feedback, hf_damping, gain;
@@ -2079,6 +2168,8 @@ static void SendStereoAudio(unsigned long count, int* samples)
 #endif
 }
 
+#endif /* Reverb & PCM audio */
+
 class Tester
 {
     unsigned cur_gm;
@@ -2208,7 +2299,7 @@ public:
             case '-': case 'K': case 'D': NextGM(-1); break;
             case '+': case 'M': case 'C': NextGM(+1); break;
             case 3:
-        #if !(!defined(__WIN32__) || defined(__CYGWIN__))
+        #if !((!defined(__WIN32__) || defined(__CYGWIN__)) && !defined(__DJGPP__))
             case 27:
         #endif
                 QuitFlag=true; break;
@@ -2292,13 +2383,15 @@ int main(int argc, char** argv)
 
     UI.Color(15); std::fflush(stderr);
     std::printf(
-        "ADLMIDI: MIDI player for Linux and Windows with OPL3 emulation\n");
+        "ADLMIDI_A: MIDI player for OPL3 hardware\n");
     std::fflush(stdout);
     UI.Color(3); std::fflush(stderr);
     std::printf(
         "(C) 2011 Joel Yliluoma -- http://bisqwit.iki.fi/source/adlmidi.html\n");
     std::fflush(stdout);
     UI.Color(7); std::fflush(stderr);
+
+#if 0 /* Reverb & PCM */
 
 #ifndef __WIN32__
     // Set up SDL
@@ -2318,6 +2411,8 @@ int main(int argc, char** argv)
             spec.samples,    spec.freq,    spec.channels,
             obtained.samples,obtained.freq,obtained.channels);
 #endif
+
+#endif /* Reverb & PCM */
 
     if(argc < 2)
     {
@@ -2422,6 +2517,8 @@ int main(int argc, char** argv)
         return 0;
     }
 
+#if 0 /* Reverb & PCM */
+
     const double mindelay = 1 / (double)PCM_RATE;
     const double maxdelay = MaxSamplesAtTime / (double)PCM_RATE;
 
@@ -2431,10 +2528,36 @@ int main(int argc, char** argv)
     SDL_PauseAudio(0);
 #endif
 
+#else
+    #define BIOStimer _farpeekl(_dos_ds, 0x46C)
+#if 1 /* timing */
+    const unsigned NewTimerFreq = 209;
+    unsigned TimerPeriod = 0x1234DDul / NewTimerFreq;
+    //disable();
+    outportb(0x43, 0x34);
+    outportb(0x40, TimerPeriod & 0xFF);
+    outportb(0x40, TimerPeriod >>   8);
+    //enable();
+    unsigned long BIOStimer_begin = BIOStimer;
+#else
+    const double NewTimerFreq = 0x1234DDul / 65536.0;
+#endif
+
+    /*_go32_dpmi_seginfo vec;
+    vec.pm_offset = (unsigned long) NewI08;
+    vec.pm_selector = _my_cs();
+    _go32_dpmi_allocate_iret_wrapper(&vec);
+    _go32_dpmi_lock_data(&I08counter, sizeof(I08counter));
+    _go32_dpmi_lock_code(&NewI08,     64); // simple estimate
+    _go32_dpmi_chain_protected_mode_interrupt_vector(8, &vec);
+    */
+#endif /* Reverb & PCM */
+
     Tester InstrumentTester(player.opl);
 
     for(double delay=0; !QuitFlag; )
     {
+#if 0 /* Reverb & PCM */
         const double eat_delay = delay < maxdelay ? delay : maxdelay;
         delay -= eat_delay;
 
@@ -2488,6 +2611,19 @@ int main(int argc, char** argv)
         #endif
             //fprintf(stderr, "Exit: %u\n", (unsigned)AudioBuffer.size());
         }
+#else
+        UI.IllustrateVolumes(0,0);
+        const double mindelay = 1.0 / NewTimerFreq;
+
+        //__asm__ volatile("sti\nhlt");
+        //usleep(10000);
+        __dpmi_yield();
+
+        static unsigned long PrevTimer = BIOStimer;
+        const unsigned long CurTimer = BIOStimer;
+        const double eat_delay = (CurTimer - PrevTimer) / (double)NewTimerFreq;
+        PrevTimer = CurTimer;
+#endif /* Reverb & PCM */
 
         double nextdelay =
             DoingInstrumentTesting
@@ -2499,16 +2635,32 @@ int main(int argc, char** argv)
         delay = nextdelay;
     }
 
+#if 0 /* Reverb & PCM */
 #ifdef __WIN32
     WindowsAudio::Close();
 #else
     SDL_CloseAudio();
 #endif
+#else
+
+#if 1 /* timing */
+    // Fix the skewed clock and reset BIOS tick rate
+    _farpokel(_dos_ds, 0x46C, BIOStimer_begin +
+        (BIOStimer - BIOStimer_begin)
+        * (0x1234DD/65536.0) / NewTimerFreq );
+    //disable();
+    outportb(0x43, 0x34);
+    outportb(0x40, 0);
+    outportb(0x40, 0);
+    //enable();
+#endif
+
+#endif
 
     if(FakeDOSshell)
     {
         fprintf(stderr,
-            "Going TSR. Type 'EXIT' to return to ADLMIDI.\n"
+            "Going TSR. Type 'EXIT' to return to ADLMIDI_A.\n"
             "\n"
           /*"Megasoft(R) Orifices 98\n"
             "    (C)Copyright Megasoft Corp 1981 - 1999.\n"*/

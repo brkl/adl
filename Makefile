@@ -79,29 +79,31 @@ CXX=g++
 CXXLINK=$(CXX)
 
 #DEBUG=-O0 -fno-inline -D_GLIBCXX_DEBUG -g -fstack-protector-all -fdata-sections
-DEBUG=-O3 -g -fexpensive-optimizations -ffast-math
+DEBUG=-O3 -fexpensive-optimizations -ffast-math
 #DEBUG += -fno-tree-vectorize
 # -march=pentium -mno-sse -mno-sse2 -mno-sse3 -mmmx
 
-CPPFLAGS+=`test -f /bin/sh.exe||pkg-config --cflags sdl`
-LDLIBS+=`test -f /bin/sh.exe||pkg-config --libs sdl`
+#CPPFLAGS+=`test -f /bin/sh.exe||pkg-config --cflags sdl`
+#LDLIBS+=`test -f /bin/sh.exe||pkg-config --libs sdl`
 
-CPPFLAGS += $(SDL)
+CPPFLAGS += -Wall -W 
+#CPPFLAGS += -ansi
 
-CPPFLAGS += -ansi -Wall -W 
-
-CXX += `test -f /bin/sh.exe&&echo '-mwin32 -mconsole -mno-cygwin'`
-CPPFLAGS += `test -f /bin/sh.exe&&echo '-I/usr/include/mingw -mno-cygwin -I/usr/include/w32api'`
-LDLIBS += `test -f /bin/sh.exe&&echo '-L/usr/local/lib -L/usr/lib/w32api -lwinmm'`
+#CXX += `test -f /bin/sh.exe&&echo '-mwin32 -mconsole -mno-cygwin'`
+#CPPFLAGS += `test -f /bin/sh.exe&&echo '-I/usr/include/mingw -mno-cygwin -I/usr/include/w32api'`
+#LDLIBS += `test -f /bin/sh.exe&&echo '-L/usr/local/lib -L/usr/lib/w32api -lwinmm'`
 # ^For cygwin. For anything else, remove this line.
+
+CXX=i586-pc-msdosdjgpp-g++ -m32 -march=i386 -mtune=generic
+LDLIBS=
 
 all: adlmidi gen_adldata dumpmiles dumpbank
 
-adlmidi: midiplay.o dbopl.o adldata.o
+adlmidi: midiplay.o adldata.o
 	$(CXXLINK)  $^  $(DEBUG) $(SDL) -o $@ $(LDLIBS)
 
-midiplay.o: midiplay.cc dbopl.h adldata.hh
-	$(CXX) $(CPPFLAGS) $<  $(DEBUG) $(SDL) -c -o $@ 
+midiplay.o: midiplay.cc adldata.hh
+	$(CXX) $(CPPFLAGS) $<  $(DEBUG) $(SDL) -o $@ -c
 
 dbopl.o: dbopl.cpp dbopl.h
 	$(CXX) $(CPPFLAGS) $<  $(DEBUG)  -c -o $@ 
