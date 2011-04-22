@@ -25,6 +25,8 @@ typedef struct vswprintf {} swprintf;
 # include <go32.h>
 # include <sys/farptr.h>
 # include <dos.h>
+# define BIOStimer _farpeekl(_dos_ds, 0x46C)
+static const unsigned NewTimerFreq = 209;
 #else
 # if !defined(__WIN32__) || defined(__CYGWIN__)
 #  include <termio.h>
@@ -39,6 +41,9 @@ typedef struct vswprintf {} swprintf;
 static const unsigned MaxCards = 1;
 static unsigned AdlBank    = 0;
 static unsigned NumFourOps = 7;
+static bool HighTremoloMode   = false;
+static bool HighVibratoMode   = false;
+static bool AdlPercussionMode = false;
 static unsigned NumCards   = 1;
 static bool QuitFlag = false, FakeDOSshell = false;
 static unsigned SkipForward = 0;
@@ -48,16 +53,23 @@ const unsigned OPLBase = 0x388;
 
 #include "adldata.hh"
 
-static const unsigned short Operators[18] =
-    {0x000,0x001,0x002, 0x008,0x009,0x00A, 0x010,0x011,0x012,
-     0x100,0x101,0x102, 0x108,0x109,0x10A, 0x110,0x111,0x112 };
-// Operator offsets for operators 0,2,4, 6,8,10, 12,14,16, and
-//                                18,20,22, 24,26,28, 30,32,34.
-// Odd operators are the same +3.
+static const unsigned short Operators[23*2] =
+    {0x000,0x003,0x001,0x004,0x002,0x005, // operators  0, 3,  1, 4,  2, 5
+     0x008,0x00B,0x009,0x00C,0x00A,0x00D, // operators  6, 9,  7,10,  8,11
+     0x010,0x013,0x011,0x014,0x012,0x015, // operators 12,15, 13,16, 14,17
+     0x100,0x103,0x101,0x104,0x102,0x105, // operators 18,21, 19,22, 20,23
+     0x108,0x10B,0x109,0x10C,0x10A,0x10D, // operators 24,27, 25,28, 26,29
+     0x110,0x113,0x111,0x114,0x112,0x115, // operators 30,33, 31,34, 32,35
+     0x010,0x013,   // operators 12,15
+     0x014,0xFFF,   // operator 16
+     0x012,0xFFF,   // operator 14
+     0x015,0xFFF,   // operator 17
+     0x011,0xFFF }; // operator 13
 
-static const unsigned short Channels[18] =
-    {0x000,0x001,0x002, 0x003,0x004,0x005, 0x006,0x007,0x008,
-     0x100,0x101,0x102, 0x103,0x104,0x105, 0x106,0x107,0x108 };
+static const unsigned short Channels[23] =
+    {0x000,0x001,0x002, 0x003,0x004,0x005, 0x006,0x007,0x008, // 0..8
+     0x100,0x101,0x102, 0x103,0x104,0x105, 0x106,0x107,0x108, // 9..17 (secondary set)
+     0x006,0x007,0x008,0xFFF,0xFFF }; // <- hw percussions, 0xFFF = no support for pitch/pan
 
 /*
     In OPL3 mode:
@@ -72,6 +84,14 @@ static const unsigned short Channels[18] =
         +3   +4   +5  +13  +14  +15  +103 +104 +105  +113 +114 +115
         +8   +9   +A                 +108 +109 +10A
         +B   +C   +D                 +10B +10C +10D
+
+    Percussion:
+      bassdrum = op(0): 0xBD bit 0x10, operators 12 (0x10) and 15 (0x13) / channels 6, 6b
+      snare    = op(3): 0xBD bit 0x08, operators 16 (0x14)               / channels 7b
+      tomtom   = op(4): 0xBD bit 0x04, operators 14 (0x12)               / channels 8
+      cym      = op(5): 0xBD bit 0x02, operators 17 (0x17)               / channels 8b
+      hihat    = op(2): 0xBD bit 0x01, operators 13 (0x11)               / channels 7
+
 
     In OPTi mode ("extended FM" in 82C924, 82C925, 82C931 chips):
          0   1   2    3    4    5    6    7     8    9   10   11   12   13   14   15   16   17
@@ -92,8 +112,15 @@ struct OPL3
 private:
     std::vector<unsigned short> ins; // index to adl[], cached, needed by Touch()
     std::vector<unsigned char> pit;  // value poked to B0, cached, needed by NoteOff)(
+    std::vector<unsigned char> regBD;
 public:
-    std::vector<char> four_op_category; // 1 = master, 2 = slave, 0 = regular
+    std::vector<char> four_op_category; // 1 = quad-master, 2 = quad-slave, 0 = regular
+                                        // 3 = percussion BassDrum
+                                        // 4 = percussion Snare
+                                        // 5 = percussion Tom
+                                        // 6 = percussion Crash cymbal
+                                        // 7 = percussion Hihat
+                                        // 8 = percussion slave
 
     void Poke(unsigned card, unsigned index, unsigned value)
     {
@@ -106,26 +133,44 @@ public:
     }
     void NoteOff(unsigned c)
     {
-        unsigned card = c/18, cc = c%18;
+        unsigned card = c/23, cc = c%23;
+        if(cc >= 18)
+        {
+            regBD[card] &= ~(0x10 >> (cc-18));
+            Poke(card, 0xBD, regBD[card]);
+            return;
+        }
         Poke(card, 0xB0 + Channels[cc], pit[c] & 0xDF);
     }
     void NoteOn(unsigned c, double hertz) // Hertz range: 0..131071
     {
-        unsigned card = c/18, cc = c%18;
+        unsigned card = c/23, cc = c%23;
         unsigned x = 0x2000;
         while(hertz >= 1023.5) { hertz /= 2.0; x += 0x400; } // Calculate octave
         x += (int)(hertz + 0.5);
-        Poke(card, 0xA0 + Channels[cc], x & 0xFF);
-        Poke(card, 0xB0 + Channels[cc], pit[c] = x >> 8);
+        unsigned chn = Channels[cc];
+        if(cc >= 18)
+        {
+            regBD[card] |= (0x10 >> (cc-18));
+            Poke(card, 0x0BD, regBD[card]);
+            x &= ~0x2000;
+            //x |= 0x800; // for test
+        }
+        if(chn != 0xFFF)
+        {
+            Poke(card, 0xA0 + chn, x & 0xFF);
+            Poke(card, 0xB0 + chn, pit[c] = x >> 8);
+        }
     }
     void Touch_Real(unsigned c, unsigned volume)
     {
         if(volume > 63) volume = 63;
-        unsigned card = c/18, cc = c%18;
-        unsigned i = ins[c], o = Operators[cc];
+        unsigned card = c/21, cc = c%21;
+        unsigned i = ins[c], o1 = Operators[cc*2], o2 = Operators[cc*2+1];
         unsigned x = adl[i].carrier_40, y = adl[i].modulator_40;
-        Poke(card, 0x40+o, (x|63) - volume + volume*(x&63)/63);
-        Poke(card, 0x43+o, (y|63) - volume + volume*(y&63)/63);
+        Poke(card, 0x40+o1, (x|63) - volume + volume*(x&63)/63);
+        if(o2 != 0xFFF)
+        Poke(card, 0x40+o2, (y|63) - volume + volume*(y&63)/63);
         // Correct formula (ST3, AdPlug):
         //   63-((63-(instrvol))/63)*chanvol
         // Reduces to (tested identical):
@@ -142,21 +187,23 @@ public:
     }
     void Patch(unsigned c, unsigned i)
     {
-        unsigned card = c/18, cc = c%18;
+        unsigned card = c/23, cc = c%23;
         static const unsigned char data[4] = {0x20,0x60,0x80,0xE0};
         ins[c] = i;
-        unsigned o1 = Operators[cc], o2 = o1 + 3;
+        unsigned o1 = Operators[cc*2+0], o2 = Operators[cc*2+1];
         unsigned x = adl[i].carrier_E862, y = adl[i].modulator_E862;
         for(unsigned a=0; a<4; ++a)
         {
             Poke(card, data[a]+o1, x&0xFF); x>>=8;
+            if(o2 != 0xFFF)
             Poke(card, data[a]+o2, y&0xFF); y>>=8;
         }
     }
     void Pan(unsigned c, unsigned value)
     {
-        unsigned card = c/18, cc = c%18;
-        Poke(card, 0xC0 + Channels[cc], adl[ins[c]].feedconn | value);
+        unsigned card = c/23, cc = c%23;
+        if(Channels[c] != 0xFFF)
+            Poke(card, 0xC0 + Channels[cc], adl[ins[c]].feedconn | value);
     }
     void Silence() // Silence all OPL channels.
     {
@@ -169,21 +216,26 @@ public:
             fprintf(stderr, "ERROR: Hardware implementation only supports 1 OPL3 card\n");
             exit(-1);
         }
-        NumChannels = NumCards * 18;
+        NumChannels = NumCards * 23;
         ins.resize(NumChannels,     189);
         pit.resize(NumChannels,       0);
+        regBD.resize(NumCards);
+        four_op_category.clear();
         four_op_category.resize(NumChannels, 0);
         static const short data[] =
         { 0x004,96, 0x004,128,        // Pulse timer
           0x105, 0, 0x105,1, 0x105,0, // Pulse OPL3 enable
-          0x001,32, 0x0BD,0x00,       // Enable wave, melodic mode
-          0x105,1                     // Enable OPL3 extensions
+          0x001,32, 0x105,1           // Enable wave, OPL3 extensions
         };
         unsigned fours = NumFourOps;
         for(unsigned card=0; card<NumCards; ++card)
         {
+            for(unsigned a=0; a< 18; ++a) Poke(card, 0xB0+Channels[a], 0x00);
             for(unsigned a=0; a< sizeof(data)/sizeof(*data); a+=2)
                 Poke(card, data[a], data[a+1]);
+            Poke(card, 0x0BD, regBD[card] = (HighTremoloMode*0x80
+                                           + HighVibratoMode*0x40
+                                           + AdlPercussionMode*0x20) );
             unsigned fours_this_card = fours > 6 ? 6 : fours;
             Poke(card, 0x104, (1 << fours_this_card) - 1);
             //fprintf(stderr, "Card %u: %u four-ops.\n", card, fours_this_card);
@@ -191,16 +243,31 @@ public:
         }
 
         // Mark all channels that are reserved for four-operator function
-        unsigned nextfour = 0;
+        unsigned nextfour = 0, perc_skip = 0;
+        for(unsigned a=0; a<NumCards; ++a)
+        {
+            for(unsigned b=0; b<5; ++b)
+                four_op_category[a*23 + 18 + b] = AdlPercussionMode ? b+3 : -1;
+            if(AdlPercussionMode)
+                for(unsigned b=0; b<3; ++b)
+                    four_op_category[a*23 + 6+b] = 8;
+        }
+
         for(unsigned a=0; a<NumFourOps; ++a)
         {
-            four_op_category[nextfour  ] = 1;
-            four_op_category[nextfour+3] = 2;
+            if((four_op_category[perc_skip+nextfour]&15) >= 3) { ++perc_skip; continue; }
+            four_op_category[perc_skip+nextfour  ] = 1;
+            four_op_category[perc_skip+nextfour+3] = 2;
             if(nextfour%3 == 2)
                 nextfour += 9-2;
             else
                 ++nextfour;
         }
+
+        /*fprintf(stdout, "Channels used as:");
+        for(size_t a=0; a<four_op_category.size(); ++a)
+            fprintf(stdout, " %d", four_op_category[a]);
+        fprintf(stdout, "\n");*/
         /*
         In two-op mode, channels 0..8 go as follows:
                       Op1[port]  Op2[port]
@@ -248,6 +315,26 @@ static const char MIDIsymbols[256+1] =
 "????????????????"
 "????????????????"
 "????????????????";
+static const char PercussionMap[256] =
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"//GM
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 3 = bass drum
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 4 = snare
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 5 = tom
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 6 = cymbal
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" // 7 = hihat
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"//GP0
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"//GP16
+//2 3 4 5 6 7 8 940 1 2 3 4 5 6 7
+"\0\0\0\3\3\7\4\7\4\5\7\5\7\5\7\5"//GP32
+//8 950 1 2 3 4 5 6 7 8 960 1 2 3
+"\5\6\5\6\6\0\5\6\0\6\0\6\5\5\5\5"//GP48
+//4 5 6 7 8 970 1 2 3 4 5 6 7 8 9
+"\5\0\0\0\0\0\7\0\0\0\0\0\0\0\0\0"//GP64
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 class Input
 {
@@ -283,7 +370,7 @@ public:
     char PeekInput()
     {
 #ifdef __DJGPP__
-        if(kbhit()) return getch();
+        if(kbhit()) { int c = getch(); return c ? c : getch(); }
 #endif
 #ifdef __WIN32__
         DWORD nread=0;
@@ -315,9 +402,9 @@ public:
     void* handle;
   #endif
     int x, y, color, txtline, maxy;
-    char background[80][1 + 18*MaxCards];
-    char slots[80][1 + 18*MaxCards];
-    unsigned char slotcolors[80][1 + 18*MaxCards];
+    char background[80][1 + 23*MaxCards];
+    char slots[80][1 + 23*MaxCards];
+    unsigned char slotcolors[80][1 + 23*MaxCards];
     bool cursor_visible;
 public:
     #ifdef __DJGPP__
@@ -338,7 +425,7 @@ public:
         }
         else
         {
-            //COORD size = { 80, 18*NumCards+5 };
+            //COORD size = { 80, 23*NumCards+5 };
             //SetConsoleScreenBufferSize(handle,size);
         }
       #endif
@@ -435,7 +522,7 @@ public:
         }
         std::fflush(stderr);
 
-        unsigned n_textlines = 18*NumCards;
+        unsigned n_textlines = 23*NumCards;
       #ifdef __WIN32__
         //if(n_textlines > 26) n_textlines -= 26; /* Reserved for tetris */
       #endif
@@ -445,7 +532,7 @@ public:
     {
         HideCursor();
         int notex = 2 + (note+55)%77;
-        int notey = 1 + adlchn % (3*18);
+        int notey = 1 + adlchn % (3*23);
         char illustrate_char = background[notex][notey];
         if(pressure > 0)
         {
@@ -490,10 +577,10 @@ public:
 
     void IllustrateVolumes(double left, double right)
     {
-        const unsigned maxy = std::min(NumCards*18, 3*18u);
-        const unsigned white_threshold  = maxy/18;
-        const unsigned red_threshold    = maxy*4/18;
-        const unsigned yellow_threshold = maxy*8/18;
+        const unsigned maxy = std::min(NumCards*23, 3*23u);
+        const unsigned white_threshold  = maxy/23;
+        const unsigned red_threshold    = maxy*4/23;
+        const unsigned yellow_threshold = maxy*8/23;
 
         double amp[2] = {left*maxy, right*maxy};
         for(unsigned y=0; y<maxy; ++y)
@@ -632,7 +719,7 @@ public:
                        :color==-1? '+' // shadow
                        :color    ? '#'
                        : (x<12?empty[emptycount][x]:'.');
-                x+=2; y+=std::max(0,(int)NumCards*18-25);
+                x+=2; y+=std::max(0,(int)NumCards*23-25);
                 UI.background[x][y]=c;
                 UI.Draw(x, y, color>2?color:1, c);
             }
@@ -669,6 +756,7 @@ public:
         } tetris;
         static int gamestate=-1, curblock, currot, curx, cury, dropping;
         static int delaycounter=-1, score, lines, combo=0;
+        static long delaytime=0;
         static int scorewipe=0, focuswipe=0, shadowy=0, next1=0, next2=0;
         switch(gamestate)
         {
@@ -687,6 +775,9 @@ public:
                     tetris.plotp(curblock,currot,curx,shadowy,-1,0);
                 }
                 tetris.plotp(curblock,currot,curx,cury, 8,0); // passthru
+            #ifdef __DJGPP__
+                delaytime=BIOStimer;
+            #endif
             case 1: // handle input
             {
                 int level = 50 - (lines/10)/5;
@@ -718,13 +809,20 @@ public:
                         }
                         if(move) break;
                     }
+            #ifdef __DJGPP__
+                    delaycounter = (BIOStimer-delaytime) > NewTimerFreq*level/50 ? level : 0;
+            #endif
                     if(!move && (dropping || ++delaycounter>=level))
-                        { my=cury+1; move=1; delaycounter=0; }
+                        { my=cury+1; move=1; delaycounter=0;
+                          #ifdef __DJGPP__
+                          delaytime=BIOStimer;
+                          #endif
+                        }
                     if(scorewipe>0 && --scorewipe==0)
                     {
-                        UI.GotoXY(15,(int)NumCards*18);
+                        UI.GotoXY(15,(int)NumCards*23);
                         fprintf(stderr,"%*s",7,""); std::fflush(stderr);
-                        UI.GotoXY(15,(int)NumCards*18+1);
+                        UI.GotoXY(15,(int)NumCards*23+1);
                         fprintf(stderr,"%*s",5,""); std::fflush(stderr);
                     }
                     if(focuswipe>0 && --focuswipe==0)
@@ -766,22 +864,22 @@ public:
                 int increment = "\0\1\4\11\31"[emptycount]*100;
                 if(emptycount) increment += combo++ * 50; else combo=0;
                 increment += cury*2; score += increment; lines += emptycount;
-                UI.GotoXY(2,(int)NumCards*18);
+                UI.GotoXY(2,(int)NumCards*23);
                 UI.Color(15); fprintf(stderr,"Score:"); std::fflush(stderr);
                 UI.Color(14); fprintf(stderr,"%6u",score); std::fflush(stderr);
-                UI.GotoXY(2,(int)NumCards*18+1);
+                UI.GotoXY(2,(int)NumCards*23+1);
                 UI.Color(15); fprintf(stderr,"Lines:"); std::fflush(stderr);
                 UI.Color(14); fprintf(stderr,"%6u",lines); std::fflush(stderr);
-                UI.GotoXY(15,(int)NumCards*18);
+                UI.GotoXY(15,(int)NumCards*23);
                 UI.Color(10); fprintf(stderr,"%+d",increment); std::fflush(stderr);
-                UI.GotoXY(15, (int)NumCards*18-5);
+                UI.GotoXY(15, (int)NumCards*23-5);
                 UI.Color(15); fprintf(stderr,"Next:"); std::fflush(stderr);
                 next2=std::rand()%7;
                 tetris.plotp(next1,0, 13,MH-4, 0,0);
                 tetris.plotp(next2,0, 13,MH-4, 8,0);
                 if(emptycount)
                 {
-                    UI.GotoXY(15,(int)NumCards*18+1);
+                    UI.GotoXY(15,(int)NumCards*23+1);
                     fprintf(stderr,"%+d",emptycount); std::fflush(stderr);
                 }
                 scorewipe=14;
@@ -1269,6 +1367,8 @@ private:
                 }
                 int i[2] = { adlins[meta].adlno1, adlins[meta].adlno2 };
 
+                if(AdlPercussionMode && PercussionMap[midiins & 0xFF]) i[1] = i[0];
+
                 // Allocate AdLib channel (the physical sound channel for the note)
                 int adlchannel[2] = { -1, -1 };
                 for(unsigned ccount = 0; ccount < 2; ++ccount)
@@ -1289,7 +1389,10 @@ private:
                         if(i[0] == i[1])
                         {
                             // Only use regular channels
-                            if(opl.four_op_category[a] != 0)
+                            int expected_mode = 0;
+                            if(AdlPercussionMode)
+                                expected_mode = PercussionMap[midiins & 0xFF];
+                            if(opl.four_op_category[a] != expected_mode)
                                 continue;
                         }
                         else
@@ -2418,8 +2521,11 @@ int main(int argc, char** argv)
     {
         UI.Color(7);  std::fflush(stderr);
         std::printf(
-            "Usage: adlmidi <midifilename> [ <banknumber> [ <numcards> [ <numfourops>] ] ]\n"
+            "Usage: adlmidi <midifilename> [-p] [-v] [-t] [ <banknumber> [ <numcards> [ <numfourops>] ] ]\n"
             "       adlmidi <midifilename> -1   To enter instrument tester\n"
+            " -p Enables adlib percussion instrument mode\n"
+            " -t Enables tremolo amplification mode\n"
+            " -v Enables vibrato amplification mode\n"
         );
         for(unsigned a=0; a<sizeof(banknames)/sizeof(*banknames); ++a)
             std::printf("%10s%2u = %s\n",
@@ -2438,6 +2544,29 @@ int main(int argc, char** argv)
             "\n"
             );
         return 0;
+    }
+
+    while(argc > 2)
+    {
+        if(!std::strcmp("-p", argv[2]))
+        {
+            AdlPercussionMode = true;
+            for(int p=2; p<argc; ++p) argv[p] = argv[p+1];
+            --argc;
+        }
+        else if(!std::strcmp("-v", argv[2]))
+        {
+            HighVibratoMode = true;
+            for(int p=2; p<argc; ++p) argv[p] = argv[p+1];
+            --argc;
+        }
+        else if(!std::strcmp("-t", argv[2]))
+        {
+            HighTremoloMode = true;
+            for(int p=2; p<argc; ++p) argv[p] = argv[p+1];
+            --argc;
+        }
+        else break;
     }
 
     if(argc >= 3)
@@ -2499,9 +2628,12 @@ int main(int argc, char** argv)
 
     std::printf(
         "Simulating %u OPL3 cards for a total of %u operators.\n"
-        "Setting up the operators as %u four-op channels, %u dual-op channels.\n",
+        "Setting up the operators as %u four-op channels, %u dual-op channels",
         NumCards, NumCards*36,
-        NumFourOps, 18*NumCards - NumFourOps*2);
+        NumFourOps, (AdlPercussionMode ? 15 : 18) * NumCards - NumFourOps*2);
+    if(AdlPercussionMode)
+        std::printf(", %u percussion channels", NumCards * 5);
+    std::printf("\n");
     std::fflush(stdout);
 
     MIDIplay player;
@@ -2529,9 +2661,8 @@ int main(int argc, char** argv)
 #endif
 
 #else
-    #define BIOStimer _farpeekl(_dos_ds, 0x46C)
+
 #if 1 /* timing */
-    const unsigned NewTimerFreq = 209;
     unsigned TimerPeriod = 0x1234DDul / NewTimerFreq;
     //disable();
     outportb(0x43, 0x34);
@@ -2543,14 +2674,6 @@ int main(int argc, char** argv)
     const double NewTimerFreq = 0x1234DDul / 65536.0;
 #endif
 
-    /*_go32_dpmi_seginfo vec;
-    vec.pm_offset = (unsigned long) NewI08;
-    vec.pm_selector = _my_cs();
-    _go32_dpmi_allocate_iret_wrapper(&vec);
-    _go32_dpmi_lock_data(&I08counter, sizeof(I08counter));
-    _go32_dpmi_lock_code(&NewI08,     64); // simple estimate
-    _go32_dpmi_chain_protected_mode_interrupt_vector(8, &vec);
-    */
 #endif /* Reverb & PCM */
 
     Tester InstrumentTester(player.opl);
